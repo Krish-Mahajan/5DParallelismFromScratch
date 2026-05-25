@@ -36,19 +36,77 @@ Think of training a large model like building cars on an assembly line:
 
 **What's split:** Individual weight matrices (each GPU holds a slice of the layer)
 
-**How it works (column-parallel):**
-1. Weight matrix W of shape (d_out, d_in) is split into row chunks across N GPUs
-2. GPU i gets W[i*chunk:(i+1)*chunk, :] — a slice of the output dimension
-3. Each GPU computes its partial output: y_i = x @ W_i^T → shape (batch, d_out/N)
-4. All-gather: concatenate partial outputs → full (batch, d_out) result
+### Column-Parallel (split output dimension)
 
-**How it works (row-parallel):**
-1. Weight matrix W is split along columns (input dimension)
-2. Input x is also split correspondingly
-3. Each GPU computes: y_i = x_i @ W_i^T → shape (batch, d_out) but partial
-4. All-reduce (sum): y = y_0 + y_1 + ... + y_{N-1}
+Split W into row chunks — each GPU computes a subset of output features:
 
-**Megatron-LM pattern:** Column-parallel (QKV, FFN up) followed by row-parallel (output proj, FFN down). This requires only one all-reduce per attention block and one per FFN block.
+```
+W shape: (512, 512), split across 4 GPUs:
+
+GPU 0: W[0:128, :]     → (128, 512)
+GPU 1: W[128:256, :]   → (128, 512)
+GPU 2: W[256:384, :]   → (128, 512)
+GPU 3: W[384:512, :]   → (128, 512)
+```
+
+Each GPU gets the FULL input x but produces only 1/4 of the output:
+```
+GPU 0: y_0 = x @ W_0^T  → (batch, 128)   ← output features 0-127
+GPU 1: y_1 = x @ W_1^T  → (batch, 128)   ← output features 128-255
+GPU 2: y_2 = x @ W_2^T  → (batch, 128)   ← output features 256-383
+GPU 3: y_3 = x @ W_3^T  → (batch, 128)   ← output features 384-511
+```
+
+**Combine: concatenate (all-gather)** → (batch, 512)
+
+### Row-Parallel (split input dimension)
+
+Split W into column chunks — each GPU gets a subset of input connections:
+
+```
+W shape: (512, 512), split across 4 GPUs:
+
+GPU 0: W[:, 0:128]     → (512, 128)
+GPU 1: W[:, 128:256]   → (512, 128)
+GPU 2: W[:, 256:384]   → (512, 128)
+GPU 3: W[:, 384:512]   → (512, 128)
+```
+
+Input x is ALSO split — each GPU gets the corresponding 128 features:
+```
+GPU 0: y_0 = x[:, 0:128]   @ W_0^T  → (batch, 512)   ← partial sum
+GPU 1: y_1 = x[:, 128:256] @ W_1^T  → (batch, 512)   ← partial sum
+GPU 2: y_2 = x[:, 256:384] @ W_2^T  → (batch, 512)   ← partial sum
+GPU 3: y_3 = x[:, 384:512] @ W_3^T  → (batch, 512)   ← partial sum
+```
+
+**Combine: sum (all-reduce)** → y = y_0 + y_1 + y_2 + y_3
+
+Why summing works: a dot product can be split into chunks and summed:
+`x · w = (x[0:128] · w[0:128]) + (x[128:256] · w[128:256]) + ...`
+
+### Key Difference
+
+| | Column-Parallel | Row-Parallel |
+|---|---|---|
+| Each GPU computes | Subset of output features | Partial sum of ALL outputs |
+| Input x | Same x on all GPUs | Split across GPUs |
+| Combine operation | **Concatenate** (all-gather) | **Sum** (all-reduce) |
+| Output per GPU | (batch, d_out/N) | (batch, d_out) |
+
+### Megatron-LM Pattern: Pair Column then Row
+
+Column-parallel followed by row-parallel avoids extra communication:
+
+```
+FFN Layer 1 (column-parallel): x → split output → each GPU has (batch, d_ff/N)
+                                    ↓ no communication needed here ↓
+FFN Layer 2 (row-parallel):    takes split input → sum → each GPU has (batch, d_model)
+```
+
+The output of column-parallel is *already split* — which is exactly the input format row-parallel needs. So no communication between the two layers. Only one all-reduce at the end.
+
+This pattern gives only **one all-reduce per attention block** and **one per FFN block**.
 
 **What gets split in a transformer:**
 - W_Q, W_K, W_V — split by attention heads (natural split, heads are independent)
