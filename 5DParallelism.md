@@ -210,6 +210,33 @@ The bubble only exists during warmup and cooldown — the steady state has zero 
 
 **Why it's needed:** Attention memory scales as O(seq²). For seq_len=32768 with 32 heads in FP16, attention scores alone = 64 GB. Exceeds a single A100.
 
+### Understanding the Memory Problem: Activations
+
+"Activations" = all intermediate results stored during the forward pass (needed for backward to compute gradients). In one transformer block:
+
+| Activation | Shape | Scaling |
+|-----------|-------|---------|
+| Input to layer | (batch, seq, d_model) | Linear with seq |
+| Q, K, V matrices | (batch, heads, seq, d_head) | Linear with seq |
+| **Attention scores** | **(batch, heads, seq, seq)** | **Quadratic with seq** |
+| Attention output | (batch, seq, d_model) | Linear with seq |
+| FFN intermediate | (batch, seq, d_ff) | Linear with seq |
+| Residual connections | (batch, seq, d_model) | Linear with seq |
+
+Most activations scale linearly with seq_len (they have one seq dimension). The attention scores are the outlier — they scale **quadratically** (seq × seq) because every token attends to every other token.
+
+**Attention score memory formula:**
+```
+mem_bytes = batch_size × n_heads × seq_len × seq_len × 2 (bytes for FP16)
+```
+
+Examples (batch=1, 32 heads, FP16):
+- seq=2048:  1 × 32 × 2048 × 2048 × 2 = **512 MB**
+- seq=8192:  1 × 32 × 8192 × 8192 × 2 = **8 GB**
+- seq=32768: 1 × 32 × 32768 × 32768 × 2 = **128 GB** (exceeds any single GPU)
+
+This is just the attention scores — not weights, gradients, or other activations. This is why sequence parallelism specifically targets the attention computation.
+
 **How it works (ring attention):**
 1. Split the sequence across GPUs: GPU 0 gets tokens 0–8191, GPU 1 gets 8192–16383, etc.
 2. Each GPU computes attention for its local tokens
